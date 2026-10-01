@@ -1,0 +1,51 @@
+# ── Secretos (NUNCA subir) ───────────────────────────────────
+.env
+.env.*
+!.env.example
+
+# ── Entorno virtual ──────────────────────────────────────────
+.venv/
+venv/
+env/
+ENV/
+
+# ── Python ───────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+pip-wheel-metadata/
+
+# ── Tests / cobertura / linters ──────────────────────────────
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+.pyre/
+.tox/
+.hypothesis/
+
+# ── Logs ─────────────────────────────────────────────────────
+*.log
+logs/
+
+# ── Supabase CLI (estado local) ──────────────────────────────
+supabase/.branches/
+supabase/.temp/
+
+# ── IDE / SO ─────────────────────────────────────────────────
+.vscode/*
+!.vscode/extensions.json
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+desktop.ini
