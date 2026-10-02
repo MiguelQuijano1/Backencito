@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import time
 
 import httpx
@@ -63,3 +64,84 @@ async def reverse_geocode(lat: float, lon: float) -> dict:
         r.raise_for_status()
         data = r.json()
     return parse_place(data.get("address") or {})
+
+
+# ── Ubicación aproximada por IP (respaldo cuando el GPS no está disponible) ──
+# Proveedores gratuitos, sin API key y con HTTPS. Se prueba el primero y, si falla
+# (límite diario, caída), el segundo. La consulta se hace desde el backend, así el
+# navegador del aula no necesita permisos ni acceso a terceros.
+#   1) ipwho.is  → https://ipwhois.io/docs   (1 000 consultas/día)
+#   2) ipapi.co  → https://ipapi.co/api/     (≈1 000 consultas/día)
+
+_IP_CACHE_TTL = 3600.0  # segundos: la misma IP no se vuelve a consultar durante 1 h
+_ip_cache: dict[str, tuple[float, dict]] = {}
+
+
+def public_ip(raw: str | None) -> str | None:
+    """Devuelve la IP solo si es válida y pública (descarta localhost y redes privadas)."""
+    if not raw:
+        return None
+    try:
+        ip = ipaddress.ip_address(raw.strip())
+    except ValueError:
+        return None
+    return str(ip) if ip.is_global else None
+
+
+async def _lookup_ipwhois(client: httpx.AsyncClient, ip: str | None) -> dict:
+    r = await client.get(f"https://ipwho.is/{ip or ''}", params={"lang": "es"})
+    r.raise_for_status()
+    d = r.json()
+    if not d.get("success", False) or d.get("latitude") is None or d.get("longitude") is None:
+        raise RuntimeError(d.get("message") or "ipwho.is no devolvió ubicación")
+    return {
+        "ip": d.get("ip"),
+        "lat": float(d["latitude"]),
+        "lon": float(d["longitude"]),
+        "city": d.get("city"),
+        "region": d.get("region"),
+        "country": d.get("country"),
+        "provider": "ipwho.is",
+    }
+
+
+async def _lookup_ipapi(client: httpx.AsyncClient, ip: str | None) -> dict:
+    url = f"https://ipapi.co/{ip}/json/" if ip else "https://ipapi.co/json/"
+    r = await client.get(url, headers={"Accept-Language": "es"})
+    r.raise_for_status()
+    d = r.json()
+    if d.get("error") or d.get("latitude") is None or d.get("longitude") is None:
+        raise RuntimeError(d.get("reason") or "ipapi.co no devolvió ubicación")
+    return {
+        "ip": d.get("ip"),
+        "lat": float(d["latitude"]),
+        "lon": float(d["longitude"]),
+        "city": d.get("city"),
+        "region": d.get("region"),
+        "country": d.get("country_name"),
+        "provider": "ipapi.co",
+    }
+
+
+async def locate_ip(ip: str | None) -> dict:
+    """Ubicación aproximada (nivel ciudad) de una IP pública.
+
+    Si `ip` es None (p. ej. desarrollo en localhost) el proveedor usa la IP desde la que
+    sale el propio backend, que en local es la de tu red.
+    """
+    key = ip or "self"
+    hit = _ip_cache.get(key)
+    if hit and time.monotonic() - hit[0] < _IP_CACHE_TTL:
+        return hit[1]
+
+    last_error: Exception | None = None
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        for lookup in (_lookup_ipwhois, _lookup_ipapi):
+            try:
+                result = await lookup(client, ip)
+            except Exception as e:  # noqa: BLE001 - se prueba el siguiente proveedor
+                last_error = e
+                continue
+            _ip_cache[key] = (time.monotonic(), result)
+            return result
+    raise RuntimeError(str(last_error) if last_error else "sin proveedores disponibles")

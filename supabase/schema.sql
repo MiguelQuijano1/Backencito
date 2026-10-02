@@ -7,6 +7,7 @@
 --    cost_overrides     → app/routers/costs.py  (upsert por region_id)
 --    compliance_status  → app/routers/security.py (upsert por framework)
 --    access_audit       → app/routers/audit.py
+--    proposals_archive  → app/routers/proposals.py (limpiar / restaurar planificaciones)
 --
 --  IDEMPOTENTE: se puede ejecutar varias veces sin romper datos existentes.
 --  No borra ni modifica filas. Ejecútalo en Supabase → SQL Editor.
@@ -109,6 +110,74 @@ alter table public.proposals         enable row level security;
 alter table public.cost_overrides    enable row level security;
 alter table public.compliance_status enable row level security;
 alter table public.access_audit      enable row level security;
+
+-- ── 5b) Archivo de planificaciones (botón "Limpiar datos" del Dashboard) ──
+--  "Limpiar" mueve las planificaciones de una región aquí (no se borran);
+--  "Restaurar" las devuelve a public.proposals con su id y fecha originales.
+
+create table if not exists public.proposals_archive (
+  id           bigint primary key,            -- id original de la planificación
+  name         text        not null,
+  type         text        not null,
+  description  text        not null default '',
+  region_id    text        not null,
+  users        text        not null,
+  availability text        not null,
+  migration    text        not null,
+  selected     text[]      not null default '{}',
+  created_at   timestamptz not null,          -- fecha original de creación
+  archived_at  timestamptz not null default now()
+);
+
+create index if not exists proposals_archive_region_idx
+  on public.proposals_archive (region_id, archived_at desc);
+
+alter table public.proposals_archive enable row level security;
+
+create or replace function public.archive_proposals(p_region_id text)
+returns integer
+language plpgsql
+as $$
+declare
+  n integer;
+begin
+  with moved as (
+    delete from public.proposals where region_id = p_region_id returning *
+  )
+  insert into public.proposals_archive
+    (id, name, type, description, region_id, users, availability, migration, selected, created_at)
+  select id, name, type, description, region_id, users, availability, migration, selected, created_at
+  from moved;
+  get diagnostics n = row_count;
+  return n;
+end;
+$$;
+
+create or replace function public.restore_proposals(p_region_id text)
+returns integer
+language plpgsql
+as $$
+declare
+  n integer;
+begin
+  with moved as (
+    delete from public.proposals_archive where region_id = p_region_id returning *
+  )
+  insert into public.proposals
+    (id, name, type, description, region_id, users, availability, migration, selected, created_at)
+  overriding system value
+  select id, name, type, description, region_id, users, availability, migration, selected, created_at
+  from moved;
+  get diagnostics n = row_count;
+  return n;
+end;
+$$;
+
+-- Solo el backend (service_role) puede llamarlas
+revoke execute on function public.archive_proposals(text) from public, anon, authenticated;
+revoke execute on function public.restore_proposals(text) from public, anon, authenticated;
+grant execute on function public.archive_proposals(text) to service_role;
+grant execute on function public.restore_proposals(text) to service_role;
 
 -- ── 6) Marca de migración (la usa /api/health) ──────────────────────
 

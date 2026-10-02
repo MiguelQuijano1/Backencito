@@ -8,6 +8,7 @@ from app.core.catalog import COMPLIANCE_FRAMEWORKS, SERVICE_CATALOG
 from app.core.config import get_settings
 from app.core.regions_meta import REGION_CATALOG, region_meta
 from app.core.supabase_client import get_supabase
+from app.services.security_checks import build_real_security
 
 
 def _haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
@@ -60,7 +61,7 @@ def _list_compliance() -> list[dict]:
     ]
 
 
-def build_snapshot() -> dict:
+def build_snapshot(https: bool = False, with_security: bool = False) -> dict:
     settings = get_settings()
     compliance = _list_compliance()
     regions = []
@@ -106,16 +107,22 @@ def build_snapshot() -> dict:
             "costTrend": [],
         }
         regions.append(region)
+        real = build_real_security(rid, compliance, https) if with_security else None
+        if real and real["complianceStatus"] != "unknown":
+            summary = {**summary, "compliance": real["complianceStatus"]}
         security[rid] = {
             "regionId": rid,
-            "score": 0,
+            "score": real["score"] if real else 0,
+            "awsConnected": settings.aws_enabled,
             "summary": summary,
             "iamCards": [],
-            "accountProtection": [
-                {"label": "Sin cuenta AWS", "status": "review", "detail": "Conecta AWS o usa solo planificaciones"}
-            ],
+            "accountProtection": [],
             "dataProtection": [],
             "compliance": compliance,
+            "groups": real["groups"] if real else [],
+            "accessStats": real["accessStats"] if real else None,
+            "accessEvents": real["accessEvents"] if real else [],
+            "generatedAt": datetime.now(timezone.utc).isoformat(),
         }
         cost_trends[rid] = {"services": [], "rows": []}
 

@@ -84,6 +84,38 @@ def create_proposal(body: ProposalIn):
     return _to_proposal(res.data[0])
 
 
+# ── Limpiar / restaurar planificaciones (archivo) ──────────────────────────
+# "Limpiar" mueve las planificaciones de una región a la tabla proposals_archive
+# (no se borran). "Restaurar" las devuelve a proposals. Ambas operaciones son
+# atómicas: las hace una función SQL (archive_proposals / restore_proposals).
+# IMPORTANTE: estas rutas van ANTES de "/{proposal_id}" para que "archived" no se
+# interprete como un id.
+
+
+@router.get("/archived")
+def archived_counts():
+    """Cuántas planificaciones archivadas hay por región."""
+    rows = get_supabase().table("proposals_archive").select("region_id").execute().data or []
+    counts: dict[str, int] = {}
+    for r in rows:
+        counts[r["region_id"]] = counts.get(r["region_id"], 0) + 1
+    return {"counts": counts, "total": sum(counts.values())}
+
+
+@router.post("/archive/{region_id}")
+def archive_region(region_id: str):
+    """Mueve todas las planificaciones de la región al archivo."""
+    res = get_supabase().rpc("archive_proposals", {"p_region_id": region_id}).execute()
+    return {"regionId": region_id, "moved": int(res.data or 0)}
+
+
+@router.post("/restore/{region_id}")
+def restore_region(region_id: str):
+    """Devuelve a la lista activa las planificaciones archivadas de la región."""
+    res = get_supabase().rpc("restore_proposals", {"p_region_id": region_id}).execute()
+    return {"regionId": region_id, "restored": int(res.data or 0)}
+
+
 @router.delete("/{proposal_id}")
 def delete_proposal(proposal_id: int):
     res = get_supabase().table("proposals").delete().eq("id", proposal_id).execute()
