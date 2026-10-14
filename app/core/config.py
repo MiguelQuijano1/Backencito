@@ -27,6 +27,9 @@ class Settings(BaseSettings):
     admin_email: str = ""
     admin_password_hash: str = ""
 
+    # URL base del API del ERP EnterpriseCloud que CloudOps vigila (vacío = no configurado)
+    erp_api_url: str = ""
+
     nominatim_base_url: str = "https://nominatim.openstreetmap.org"
     nominatim_user_agent: str = "Backencito/1.0 (proyecto-escolar)"
 
