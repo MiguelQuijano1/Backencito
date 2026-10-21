@@ -2,7 +2,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.core.config import get_settings
-from app.routers import audit, catalog, costs, erp_security, geo, health, proposals, regions, security
+from app.routers import audit, catalog, costs, erp_security, geo, health, project_analysis, proposals, regions, security
 
 settings = get_settings()
 
@@ -30,6 +30,7 @@ app.include_router(costs.router, prefix=API)
 app.include_router(audit.router, prefix=API)
 app.include_router(geo.router, prefix=API)
 app.include_router(erp_security.router, prefix=API)
+app.include_router(project_analysis.router, prefix=API)
 
 
 @app.get("/")

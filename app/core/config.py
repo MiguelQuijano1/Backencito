@@ -30,6 +30,16 @@ class Settings(BaseSettings):
     # URL base del API del ERP EnterpriseCloud que CloudOps vigila (vacío = no configurado)
     erp_api_url: str = ""
 
+    # ── Análisis de proyectos con Gemini (pestaña "Análisis de proyecto" en Seguridad) ──
+    gemini_api_key: str = ""
+    gemini_model: str = "gemini-3.5-flash"
+    gemini_timeout_seconds: int = 120
+    analysis_max_files: int = 400
+    analysis_max_file_kb: int = 200
+    analysis_max_total_kb: int = 900
+    analysis_max_zip_mb: int = 50
+    analysis_max_zip_entries: int = 20000
+
     nominatim_base_url: str = "https://nominatim.openstreetmap.org"
     nominatim_user_agent: str = "Backencito/1.0 (proyecto-escolar)"
 
