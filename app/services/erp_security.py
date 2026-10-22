@@ -24,8 +24,11 @@ LOCAL_HOSTS = {"localhost", "127.0.0.1", "::1", "0.0.0.0"}
 
 # Rutas de listado del ERP que NUNCA deben responder sin sesión.
 PROTECTED_PATHS = [
-    "/users", "/roles", "/audit", "/settings", "/customers", "/suppliers", "/products",
-    "/quotations", "/sales-orders", "/purchase-orders", "/sales-invoices",
+    "/users", "/roles", "/permissions", "/audit", "/settings", "/customers", "/suppliers", "/products",
+    "/categories", "/warehouses", "/drivers", "/vehicles", "/quotations", "/sales-orders", "/sales-invoices",
+    "/purchase-requests", "/purchase-orders", "/supplier-products", "/goods-receipts", "/stock", "/kardex",
+    "/transfers", "/adjustments", "/receivables", "/payables", "/cash", "/bank-accounts", "/bank-movements",
+    "/documents", "/dashboard",
 ]
 REQUIRED_HEADERS = {
     "x-content-type-options": "nosniff",

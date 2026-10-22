@@ -75,22 +75,26 @@ GAP_TEXT = {
 
 # ── Módulos del ERP ────────────────────────────────────────────────────────
 # criticality: qué tan grave es una falla en ese módulo (0-1). gaps: (servicio, peso).
+# Los módulos y rutas espejan el catálogo de permisos del ERP (app/security/catalog.py) y su router (/api/v1).
 MODULES = [
     {"id": "finanzas", "label": "Finanzas", "criticality": 1.0,
      "paths": ["/receivables", "/payables", "/cash", "/bank-accounts", "/bank-movements"],
      "gaps": [("waf", 2), ("threat", 2), ("backup", 3), ("kms", 3)]},
     {"id": "sistema", "label": "Administración del sistema", "criticality": 1.0,
-     "paths": ["/users", "/roles", "/audit", "/settings"],
+     "paths": ["/users", "/roles", "/permissions", "/audit", "/settings"],
      "gaps": [("waf", 2), ("threat", 3), ("secrets", 3), ("kms", 2), ("backup", 2)]},
     {"id": "ventas", "label": "Ventas", "criticality": 0.8,
-     "paths": ["/quotations", "/sales-orders", "/sales-invoices", "/customers"],
+     "paths": ["/quotations", "/sales-orders", "/sales-invoices"],
      "gaps": [("waf", 2), ("threat", 2), ("backup", 2), ("kms", 1)]},
     {"id": "compras", "label": "Compras", "criticality": 0.8,
-     "paths": ["/purchase-orders", "/goods-receipts", "/suppliers"],
+     "paths": ["/purchase-requests", "/purchase-orders", "/supplier-products"],
      "gaps": [("waf", 2), ("threat", 2), ("backup", 2), ("kms", 1)]},
-    {"id": "inventario", "label": "Inventario", "criticality": 0.6,
-     "paths": ["/stock", "/kardex", "/transfers", "/adjustments", "/products"],
+    {"id": "inventario", "label": "Inventario y Kardex", "criticality": 0.6,
+     "paths": ["/stock", "/goods-receipts", "/kardex", "/transfers", "/adjustments"],
      "gaps": [("waf", 2), ("threat", 2), ("backup", 2)]},
+    {"id": "mantenimiento", "label": "Mantenimiento (datos maestros)", "criticality": 0.6,
+     "paths": ["/customers", "/suppliers", "/products", "/categories", "/warehouses", "/drivers", "/vehicles"],
+     "gaps": [("waf", 2), ("threat", 2), ("backup", 3)]},
     {"id": "documentos", "label": "Documentos y reportes", "criticality": 0.5,
      "paths": ["/documents", "/dashboard"],
      "gaps": [("waf", 2), ("threat", 2), ("kms", 2), ("backup", 1)]},
@@ -103,7 +107,7 @@ DECLARED = [
     ("audit", "Auditoría de acciones", 2,
      "Las acciones quedan registradas en la auditoría del ERP (servicio de auditoría en el backend)."),
     ("rate", "Límite de peticiones y bloqueo de cuenta", 1,
-     "El backend limita peticiones y bloquea la cuenta tras intentos fallidos de inicio de sesión."),
+     "El backend limita las peticiones por IP (global y 10 inicios de sesión por minuto) y bloquea la cuenta tras varios intentos fallidos."),
 ]
 
 SCORE_VALUE = {"healthy": 1.0, "review": 0.5, "issue": 0.0}

@@ -33,10 +33,14 @@ class Settings(BaseSettings):
     # ── Análisis de proyectos con Gemini (pestaña "Análisis de proyecto" en Seguridad) ──
     gemini_api_key: str = ""
     gemini_model: str = "gemini-3.5-flash"
+    # Si el modelo principal da 429 (cuota) o 404, se prueban estos en orden (separados por coma).
+    gemini_fallback_models: str = "gemini-3.5-flash-lite,gemini-2.5-flash-lite"
     gemini_timeout_seconds: int = 120
-    analysis_max_files: int = 400
-    analysis_max_file_kb: int = 200
-    analysis_max_total_kb: int = 900
+    gemini_max_output_tokens: int = 12288
+    # Límites pensados para el plan gratuito: ~300 KB de código ≈ 75-100 mil tokens por petición.
+    analysis_max_files: int = 150
+    analysis_max_file_kb: int = 100
+    analysis_max_total_kb: int = 300
     analysis_max_zip_mb: int = 50
     analysis_max_zip_entries: int = 20000
 

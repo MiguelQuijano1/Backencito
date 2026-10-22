@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import io
 import json
+import logging
 import re
 import time
 import zipfile
@@ -294,31 +295,124 @@ def _extract_json(text: str) -> dict:
         raise
 
 
+log = logging.getLogger("project_analysis")
+
+# Tras un 429 se bloquean nuevos intentos unos segundos: así los clics repetidos no gastan más cuota.
+_cooldown_until = 0.0
+
+
+def cooldown_remaining() -> int:
+    return max(0, int(_cooldown_until - time.time()))
+
+
+def _set_cooldown(seconds: float) -> None:
+    global _cooldown_until
+    _cooldown_until = time.time() + seconds
+
+
+def _retry_delay(res: httpx.Response) -> float | None:
+    """Segundos de espera que sugiere Gemini en un 429 (campo retryDelay o texto 'retry in 23s')."""
+    try:
+        err = res.json().get("error", {})
+    except ValueError:
+        return None
+    for d in err.get("details") or []:
+        v = d.get("retryDelay") if isinstance(d, dict) else None
+        if isinstance(v, str) and v.endswith("s"):
+            try:
+                return float(v[:-1])
+            except ValueError:
+                pass
+    m = re.search(r"retry in ([\d.]+)\s*s", str(err.get("message", "")), re.I)
+    return float(m.group(1)) if m else None
+
+
+def _quota_kind(res: httpx.Response) -> str:
+    """'daily' (cuota por día), 'tokens' (tokens por minuto) o 'minute' (peticiones por minuto)."""
+    t = res.text.lower()
+    if "perday" in t or "per day" in t:
+        return "daily"
+    if "token" in t:
+        return "tokens"
+    return "minute"
+
+
+def _raise_quota(res: httpx.Response) -> None:
+    kind = _quota_kind(res)
+    delay = _retry_delay(res)
+    wait = int(delay) + 1 if delay else 60
+    _set_cooldown(300 if kind == "daily" else min(wait, 120))
+    if kind == "daily":
+        msg = ("Se agotó la cuota DIARIA gratuita de Gemini (se reinicia a medianoche, hora del Pacífico). "
+               "Prueba mañana, usa una clave de otro proyecto de Google o activa la facturación.")
+    elif kind == "tokens":
+        msg = (f"El proyecto es demasiado grande para el límite de tokens por minuto del plan gratuito. "
+               f"Sube solo las carpetas de código (src, app…) y reintenta en {wait} s.")
+    else:
+        msg = f"Límite de peticiones por minuto de Gemini alcanzado. Reintenta en {wait} s."
+    raise HTTPException(429, detail=msg, headers={"Retry-After": str(300 if kind == "daily" else wait)})
+
+
 def call_gemini(prompt: str) -> dict:
     s = get_settings()
     if not s.gemini_api_key:
         raise HTTPException(503, detail="Falta GEMINI_API_KEY en el .env de Backencito (créala gratis en https://aistudio.google.com/apikey).")
 
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{s.gemini_model}:generateContent"
     body = {
         "systemInstruction": {"parts": [{"text": SYSTEM_PROMPT}]},
         "contents": [{"role": "user", "parts": [{"text": prompt}]}],
-        "generationConfig": {"temperature": 0.2, "responseMimeType": "application/json", "maxOutputTokens": 16384},
+        "generationConfig": {"temperature": 0.2, "responseMimeType": "application/json", "maxOutputTokens": s.gemini_max_output_tokens},
     }
     headers = {"x-goog-api-key": s.gemini_api_key, "Content-Type": "application/json"}
+    models = [s.gemini_model] + [m.strip() for m in s.gemini_fallback_models.split(",") if m.strip() and m.strip() != s.gemini_model]
 
-    res = None
-    for attempt in range(2):
-        try:
-            res = httpx.post(url, json=body, headers=headers, timeout=s.gemini_timeout_seconds)
-        except httpx.TimeoutException:
-            raise HTTPException(504, detail="Gemini tardó demasiado en responder. Prueba con menos archivos.")
-        except httpx.HTTPError as e:
-            raise HTTPException(502, detail=f"No se pudo conectar con Gemini: {e}")
-        if res.status_code in (500, 503) and attempt == 0:
-            time.sleep(2)
+    res: httpx.Response | None = None
+    used = s.gemini_model
+    quota_res: httpx.Response | None = None
+    overloaded = False
+    missing: list[str] = []
+    for model in models:
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+        for attempt in range(3):
+            try:
+                res = httpx.post(url, json=body, headers=headers, timeout=s.gemini_timeout_seconds)
+            except httpx.TimeoutException:
+                raise HTTPException(504, detail="Gemini tardó demasiado en responder. Prueba con menos archivos.")
+            except httpx.HTTPError as e:
+                log.error("Gemini: error de conexión: %s", e)
+                raise HTTPException(502, detail=f"No se pudo conectar con Gemini: {e}")
+            if res.status_code in (500, 502, 503, 504) and attempt < 2:
+                log.warning("Gemini %s: %s (saturado), reintento %s/2", model, res.status_code, attempt + 1)
+                time.sleep(3 if attempt == 0 else 6)
+                continue
+            if res.status_code == 429 and attempt == 0:
+                delay = _retry_delay(res)
+                if _quota_kind(res) == "minute" and delay is not None and delay <= 15:
+                    time.sleep(delay + 1)  # espera corta y un solo reintento con el mismo modelo
+                    continue
+            break
+        assert res is not None
+        used = model
+        if res.status_code == 429:
+            log.warning("Gemini %s: 429 %s", model, res.text[:300])
+            quota_res = res
+            continue  # prueba el siguiente modelo (cada modelo tiene su propia cuota)
+        if res.status_code in (500, 502, 503, 504):
+            log.warning("Gemini %s sigue saturado (%s); pruebo el siguiente modelo", model, res.status_code)
+            overloaded = True
+            continue
+        if res.status_code == 404:
+            log.warning("Gemini: el modelo %s no existe o no está disponible", model)
+            missing.append(model)
             continue
         break
+    else:
+        if overloaded:
+            _set_cooldown(15)
+            raise HTTPException(503, detail="Los modelos de Gemini están saturados en este momento (es temporal y del lado de Google). Espera un minuto y vuelve a intentar.", headers={"Retry-After": "15"})
+        if quota_res is not None:
+            _raise_quota(quota_res)
+        raise HTTPException(502, detail=f"Ningún modelo está disponible ({', '.join(missing)}). Revisa GEMINI_MODEL en el .env.")
 
     assert res is not None
     if res.status_code != 200:
@@ -326,12 +420,9 @@ def call_gemini(prompt: str) -> dict:
             api_msg = res.json().get("error", {}).get("message", "")
         except ValueError:
             api_msg = ""
-        if res.status_code == 429:
-            raise HTTPException(429, detail="Se alcanzó el límite gratuito de Gemini. Espera un minuto o prueba con menos archivos.")
+        log.error("Gemini %s respondió %s: %s", used, res.status_code, res.text[:500])
         if res.status_code in (401, 403):
             raise HTTPException(502, detail="Gemini rechazó la clave (GEMINI_API_KEY inválida o sin permisos).")
-        if res.status_code == 404:
-            raise HTTPException(502, detail=f"El modelo '{s.gemini_model}' no existe o no está disponible. Cambia GEMINI_MODEL en el .env.")
         raise HTTPException(502, detail=f"Gemini respondió con error {res.status_code}: {api_msg[:300]}")
 
     data = res.json()
@@ -344,10 +435,15 @@ def call_gemini(prompt: str) -> dict:
     parts = (cands[0].get("content") or {}).get("parts") or []
     text = "".join(p.get("text", "") for p in parts if not p.get("thought"))
     try:
-        return _extract_json(text)
+        out = _extract_json(text)
     except (json.JSONDecodeError, ValueError):
+        log.error("Gemini %s: JSON ilegible (finishReason=%s): %s", used, cands[0].get("finishReason"), text[:300])
         hint = " (respuesta cortada: sube menos archivos)" if cands[0].get("finishReason") == "MAX_TOKENS" else ""
         raise HTTPException(502, detail=f"Gemini devolvió una respuesta que no se pudo leer{hint}. Intenta de nuevo.")
+    if not isinstance(out, dict):
+        raise HTTPException(502, detail="Gemini devolvió un formato inesperado. Intenta de nuevo.")
+    out["_model"] = used
+    return out
 
 
 # ═════════════════════════════ 3. Informe final ══════════════════════════════
@@ -434,7 +530,7 @@ def build_report(raw: dict, prepared: dict) -> dict:
 
     return {
         "analyzedAt": datetime.now(timezone.utc).isoformat(),
-        "model": get_settings().gemini_model,
+        "model": _str(raw.get("_model"), 60) or get_settings().gemini_model,
         "summary": _str(raw.get("projectSummary"), 500),
         "stack": str_list(raw.get("stack"), 60, 15),
         "security": {"score": security, "risk": sec_risk, "findings": sum(1 for f in findings if f["category"] == "security")},
