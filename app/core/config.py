@@ -37,6 +37,8 @@ class Settings(BaseSettings):
     gemini_fallback_models: str = "gemini-3.5-flash-lite,gemini-2.5-flash-lite"
     gemini_timeout_seconds: int = 120
     gemini_max_output_tokens: int = 12288
+    # Si analizas exactamente los mismos archivos otra vez, se reutiliza el resultado (0 = desactivado) y no gasta cuota.
+    analysis_cache_minutes: int = 60
     # Límites pensados para el plan gratuito: ~300 KB de código ≈ 75-100 mil tokens por petición.
     analysis_max_files: int = 150
     analysis_max_file_kb: int = 100

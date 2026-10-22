@@ -32,11 +32,6 @@ def project_analysis(files: list[UploadFile] = File(...), paths: list[str] = For
     """Recibe un .zip del proyecto (o archivos sueltos) por multipart y devuelve el análisis hecho con Gemini."""
     s = get_settings()
 
-    # Si Gemini acaba de rechazar por cuota, no se vuelve a llamar hasta que pase la espera (no gasta más cuota).
-    wait = cooldown_remaining()
-    if wait:
-        raise HTTPException(429, detail=f"Gemini sigue sin cuota disponible. Reintenta en {wait} s.", headers={"Retry-After": str(wait)})
-
     if len(files) > s.analysis_max_files * 5:
         raise HTTPException(400, detail="Demasiados archivos. Sube solo el código del proyecto (sin node_modules ni .git).")
 

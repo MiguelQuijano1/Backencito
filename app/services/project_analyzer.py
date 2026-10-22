@@ -13,6 +13,8 @@ Reglas de porcentaje (editables abajo):
 """
 from __future__ import annotations
 
+import copy
+import hashlib
 import io
 import json
 import logging
@@ -283,15 +285,22 @@ def _build_prompt(files: list[dict], skipped: dict[str, int]) -> str:
     return f"Archivos recibidos ({len(files)}):\n{tree}\n\nArchivos omitidos: {omitted}\n\n{body}"
 
 
+def _loads(t: str):
+    try:
+        return json.loads(t, strict=False)  # strict=False tolera saltos de línea/tabs sin escapar dentro de los textos
+    except json.JSONDecodeError:
+        return json.loads(re.sub(r",\s*([}\]])", r"\1", t), strict=False)  # comas sobrantes antes de } o ]
+
+
 def _extract_json(text: str) -> dict:
     t = text.strip()
     t = re.sub(r"^```(?:json)?\s*|\s*```$", "", t, flags=re.I)
     try:
-        return json.loads(t)
+        return _loads(t)
     except json.JSONDecodeError:
         start, end = t.find("{"), t.rfind("}")
         if start != -1 and end > start:
-            return json.loads(t[start:end + 1])
+            return _loads(t[start:end + 1])
         raise
 
 
@@ -299,6 +308,13 @@ log = logging.getLogger("project_analysis")
 
 # Tras un 429 se bloquean nuevos intentos unos segundos: así los clics repetidos no gastan más cuota.
 _cooldown_until = 0.0
+
+# Modelos que Google respondió 404: no se vuelven a intentar hasta reiniciar el backend (ahorra tiempo y peticiones).
+_dead_models: set[str] = set()
+
+# Resultados recientes por huella de los archivos: analizar lo mismo otra vez no gasta cuota.
+_report_cache: dict[str, tuple[float, dict]] = {}
+CACHE_MAX_ENTRIES = 20
 
 
 def cooldown_remaining() -> int:
@@ -327,18 +343,32 @@ def _retry_delay(res: httpx.Response) -> float | None:
     return float(m.group(1)) if m else None
 
 
-def _quota_kind(res: httpx.Response) -> str:
-    """'daily' (cuota por día), 'tokens' (tokens por minuto) o 'minute' (peticiones por minuto)."""
-    t = res.text.lower()
+def _quota_info(res: httpx.Response) -> tuple[str, list[str]]:
+    """('daily' | 'tokens' | 'minute', ids de las cuotas excedidas según Google)."""
+    ids: list[str] = []
+    try:
+        for d in res.json().get("error", {}).get("details") or []:
+            if isinstance(d, dict):
+                for v in d.get("violations") or []:
+                    if isinstance(v, dict):
+                        ids.append(str(v.get("quotaId") or v.get("quotaMetric") or ""))
+    except ValueError:
+        pass
+    ids = [i for i in ids if i]
+    t = (" ".join(ids) or res.text).lower()
     if "perday" in t or "per day" in t:
-        return "daily"
+        return "daily", ids[:4]
     if "token" in t:
-        return "tokens"
-    return "minute"
+        return "tokens", ids[:4]
+    return "minute", ids[:4]
+
+
+def _quota_kind(res: httpx.Response) -> str:
+    return _quota_info(res)[0]
 
 
 def _raise_quota(res: httpx.Response) -> None:
-    kind = _quota_kind(res)
+    kind, ids = _quota_info(res)
     delay = _retry_delay(res)
     wait = int(delay) + 1 if delay else 60
     _set_cooldown(300 if kind == "daily" else min(wait, 120))
@@ -350,10 +380,33 @@ def _raise_quota(res: httpx.Response) -> None:
                f"Sube solo las carpetas de código (src, app…) y reintenta en {wait} s.")
     else:
         msg = f"Límite de peticiones por minuto de Gemini alcanzado. Reintenta en {wait} s."
+    if ids:
+        msg += f" (límite excedido: {ids[0]})"
     raise HTTPException(429, detail=msg, headers={"Retry-After": str(300 if kind == "daily" else wait)})
 
 
+class _UnreadableResponse(Exception):
+    def __init__(self, truncated: bool) -> None:
+        super().__init__("respuesta ilegible")
+        self.truncated = truncated
+
+
 def call_gemini(prompt: str) -> dict:
+    """Llama a Gemini; si la respuesta llega con JSON dañado (sin estar cortada) reintenta una sola vez."""
+    try:
+        return _call_gemini_once(prompt)
+    except _UnreadableResponse as e:
+        if e.truncated:
+            raise HTTPException(502, detail="Gemini devolvió una respuesta cortada: sube menos archivos e inténtalo de nuevo.")
+        log.warning("Gemini devolvió un JSON dañado; reintento una vez")
+        time.sleep(2)
+        try:
+            return _call_gemini_once(prompt)
+        except _UnreadableResponse:
+            raise HTTPException(502, detail="Gemini devolvió dos veces una respuesta que no se pudo leer. Inténtalo de nuevo en un momento.")
+
+
+def _call_gemini_once(prompt: str) -> dict:
     s = get_settings()
     if not s.gemini_api_key:
         raise HTTPException(503, detail="Falta GEMINI_API_KEY en el .env de Backencito (créala gratis en https://aistudio.google.com/apikey).")
@@ -365,6 +418,7 @@ def call_gemini(prompt: str) -> dict:
     }
     headers = {"x-goog-api-key": s.gemini_api_key, "Content-Type": "application/json"}
     models = [s.gemini_model] + [m.strip() for m in s.gemini_fallback_models.split(",") if m.strip() and m.strip() != s.gemini_model]
+    models = [m for m in models if m not in _dead_models] or models
 
     res: httpx.Response | None = None
     used = s.gemini_model
@@ -394,7 +448,8 @@ def call_gemini(prompt: str) -> dict:
         assert res is not None
         used = model
         if res.status_code == 429:
-            log.warning("Gemini %s: 429 %s", model, res.text[:300])
+            kind, ids = _quota_info(res)
+            log.warning("Gemini %s: 429 (%s) %s", model, kind, ", ".join(ids) or res.text[:200])
             quota_res = res
             continue  # prueba el siguiente modelo (cada modelo tiene su propia cuota)
         if res.status_code in (500, 502, 503, 504):
@@ -402,7 +457,8 @@ def call_gemini(prompt: str) -> dict:
             overloaded = True
             continue
         if res.status_code == 404:
-            log.warning("Gemini: el modelo %s no existe o no está disponible", model)
+            log.warning("Gemini: el modelo %s no existe o no está disponible; se omitirá hasta reiniciar", model)
+            _dead_models.add(model)
             missing.append(model)
             continue
         break
@@ -422,7 +478,7 @@ def call_gemini(prompt: str) -> dict:
             api_msg = ""
         log.error("Gemini %s respondió %s: %s", used, res.status_code, res.text[:500])
         if res.status_code in (401, 403):
-            raise HTTPException(502, detail="Gemini rechazó la clave (GEMINI_API_KEY inválida o sin permisos).")
+            raise HTTPException(502, detail=f"Gemini rechazó la clave ({res.status_code}): {api_msg[:200] or 'sin detalle'}. Revisa GEMINI_API_KEY en el .env (completa, sin comillas ni espacios) o crea una nueva.")
         raise HTTPException(502, detail=f"Gemini respondió con error {res.status_code}: {api_msg[:300]}")
 
     data = res.json()
@@ -437,9 +493,9 @@ def call_gemini(prompt: str) -> dict:
     try:
         out = _extract_json(text)
     except (json.JSONDecodeError, ValueError):
-        log.error("Gemini %s: JSON ilegible (finishReason=%s): %s", used, cands[0].get("finishReason"), text[:300])
-        hint = " (respuesta cortada: sube menos archivos)" if cands[0].get("finishReason") == "MAX_TOKENS" else ""
-        raise HTTPException(502, detail=f"Gemini devolvió una respuesta que no se pudo leer{hint}. Intenta de nuevo.")
+        finish = cands[0].get("finishReason")
+        log.error("Gemini %s: JSON ilegible (finishReason=%s, %s caracteres): %s ... %s", used, finish, len(text), text[:150], text[-150:])
+        raise _UnreadableResponse(truncated=finish == "MAX_TOKENS")
     if not isinstance(out, dict):
         raise HTTPException(502, detail="Gemini devolvió un formato inesperado. Intenta de nuevo.")
     out["_model"] = used
@@ -564,5 +620,30 @@ def analyze_project(items: list[tuple[str, bytes]], pre_skipped: dict[str, int] 
         prepared["skipped"][reason] = prepared["skipped"].get(reason, 0) + n
     if not prepared["files"]:
         raise HTTPException(400, detail="No hay archivos analizables. Sube código fuente o configuración (.ts, .py, .json, .yml, Dockerfile…), no imágenes ni node_modules.")
-    raw = call_gemini(_build_prompt(prepared["files"], prepared["skipped"]))
-    return build_report(raw, prepared)
+    prompt = _build_prompt(prepared["files"], prepared["skipped"])
+
+    ttl = get_settings().analysis_cache_minutes * 60
+    key = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
+    hit = _report_cache.get(key) if ttl > 0 else None
+    if hit and time.time() - hit[0] < ttl:
+        report = copy.deepcopy(hit[1])
+        minutes = max(1, int((time.time() - hit[0]) / 60))
+        report["cached"] = True
+        report["warnings"] = [
+            f"Resultado reutilizado: estos mismos archivos se analizaron hace {minutes} min, así que no se gastó cuota de Gemini. "
+            "Cambia algún archivo para obtener un análisis nuevo."
+        ] + report["warnings"]
+        return report
+
+    # Si Gemini acaba de rechazar por cuota, no se vuelve a llamar hasta que pase la espera.
+    wait = cooldown_remaining()
+    if wait:
+        raise HTTPException(429, detail=f"Gemini sigue sin cuota disponible. Reintenta en {wait} s.", headers={"Retry-After": str(wait)})
+
+    raw = call_gemini(prompt)
+    report = build_report(raw, prepared)
+    if ttl > 0:
+        _report_cache[key] = (time.time(), copy.deepcopy(report))
+        while len(_report_cache) > CACHE_MAX_ENTRIES:
+            _report_cache.pop(min(_report_cache, key=lambda k: _report_cache[k][0]))
+    return report
